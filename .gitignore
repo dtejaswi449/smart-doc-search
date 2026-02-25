@@ -1,0 +1,19 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment variables
+.env
+
+# OS
+.DS_Store
+
+# Streamlit
+.streamlit/
+
+# Vector stores / caches
+*.faiss
+*.pkl
