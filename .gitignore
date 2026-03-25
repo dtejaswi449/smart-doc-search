@@ -17,3 +17,6 @@ __pycache__/
 # Vector stores / caches
 *.faiss
 *.pkl
+
+# SQLite monitoring database (auto-generated at runtime)
+query_logs.db

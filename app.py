@@ -1,10 +1,13 @@
+import math
 import os
 import re
+import time
 import numpy as np
 import streamlit as st
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from logger import QueryLogger
 
 load_dotenv()  # loads GROQ_API_KEY from .env if present
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -12,6 +15,9 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.prompts import PromptTemplate
+from langchain_core.tools import StructuredTool
+from langchain.agents import create_react_agent, AgentExecutor
 from sentence_transformers import CrossEncoder
 from rank_bm25 import BM25Okapi
 
@@ -23,20 +29,26 @@ CHUNK_SIZE = 800
 CHUNK_OVERLAP = 200
 MIN_CHARS_PER_PAGE = 100
 
-#embedding model
 EMBEDDINGS_MODEL = "BAAI/bge-large-en-v1.5"
-
-#cross-encoder reranker
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-
-#Groq LLM (free, fast)
 GROQ_MODEL = "llama-3.1-8b-instant"
+
+# Patterns that indicate the agent couldn't find a good answer
+WEAK_ANSWER_PATTERNS = [
+    "could not find",
+    "not in the document",
+    "no information",
+    "unable to find",
+    "don't have information",
+    "cannot find",
+    "not mentioned",
+    "no relevant",
+]
 
 st.set_page_config(page_title=APP_TITLE, page_icon=APP_ICON)
 st.title(APP_TITLE)
 
 # ---------- SIDEBAR: Groq API Key ----------
-# Auto-loads from .env; sidebar field is a fallback for others running this app
 _env_key = os.getenv("GROQ_API_KEY", "")
 groq_api_key = st.sidebar.text_input(
     "Groq API Key",
@@ -48,10 +60,34 @@ groq_api_key = st.sidebar.text_input(
 if not groq_api_key:
     st.sidebar.info("Get a free key at [console.groq.com](https://console.groq.com)")
 
+# ---------- SIDEBAR: Monitoring ----------
+st.sidebar.divider()
+st.sidebar.subheader("Monitoring")
+_stats = get_logger().stats() if True else {}  # always fresh
+_corpus = get_logger().corpus_stats()
+if _corpus.get("total_documents"):
+    st.sidebar.markdown(
+        f"**Corpus:** {_corpus['total_documents']} PDF(s) · "
+        f"{_corpus['total_pages'] or 0} pages · "
+        f"{_corpus['total_chunks'] or 0} chunks"
+    )
+if _stats.get("total_queries"):
+    st.sidebar.markdown(
+        f"**Queries:** {_stats['total_queries']} total · "
+        f"{int(_stats.get('reflection_count') or 0)} reflected"
+    )
+    if _stats.get("mean_confidence") is not None:
+        st.sidebar.markdown(f"**Avg confidence:** {_stats['mean_confidence']:.2f}")
+    if _stats.get("mean_faithfulness") is not None:
+        st.sidebar.markdown(f"**Avg faithfulness:** {_stats['mean_faithfulness']:.2f}")
+    if _stats.get("mean_latency_ms") is not None:
+        st.sidebar.markdown(f"**Avg latency:** {_stats['mean_latency_ms'] / 1000:.1f}s")
+else:
+    st.sidebar.caption("No queries logged yet.")
+
 # ---------- CACHED RESOURCES ----------
 @st.cache_resource(show_spinner=False)
 def get_embeddings():
-    # normalize_embeddings=True is recommended for bge models
     return HuggingFaceEmbeddings(
         model_name=EMBEDDINGS_MODEL,
         model_kwargs={"device": "cpu"},
@@ -62,18 +98,20 @@ def get_embeddings():
 def get_reranker():
     return CrossEncoder(RERANKER_MODEL)
 
-def get_llm(api_key):
-    return ChatGroq(model=GROQ_MODEL, groq_api_key=api_key, temperature=0, max_tokens=512)
+@st.cache_resource(show_spinner=False)
+def get_logger():
+    return QueryLogger()
+
+def get_llm(api_key: str) -> ChatGroq:
+    # tool_choice="auto" lets Groq decide whether to call a tool
+    return ChatGroq(model=GROQ_MODEL, groq_api_key=api_key, temperature=0, max_tokens=1024)
 
 
+# ---------- TEXT HELPERS ----------
 def clean_text(text: str) -> str:
-    # Collapse 3+ newlines → 2
     text = re.sub(r"\n{3,}", "\n\n", text)
-    # Collapse multiple spaces/tabs
     text = re.sub(r"[ \t]{2,}", " ", text)
-    # Remove standalone page numbers (lines with only digits)
     text = re.sub(r"(?m)^\s*\d+\s*$", "", text)
-    # Drop lines that are too short to be real content (headers/footers)
     lines = [l for l in text.split("\n") if len(l.strip()) > 3 or l.strip() == ""]
     return "\n".join(lines).strip()
 
@@ -95,7 +133,6 @@ def is_likely_scanned(counts, min_chars=MIN_CHARS_PER_PAGE):
     return low > max(1, len(counts) // 2)
 
 def make_chunks(pages):
-    # Sentence-aware separators: tries to split on paragraph → sentence → word boundaries
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
@@ -117,75 +154,221 @@ def make_chunks(pages):
     return docs
 
 
+# ---------- INDEX HELPERS ----------
 def build_bm25(docs):
     corpus = [doc.page_content.lower().split() for doc in docs]
     return BM25Okapi(corpus)
 
-def hybrid_search(query, vectorstore, bm25, all_docs, k=8):
-    # Semantic leg
-    semantic_hits = vectorstore.similarity_search_with_score(query, k=k)
-
-    # Normalize FAISS L2 scores → higher = better
-    max_s = max((s for _, s in semantic_hits), default=1e-9) + 1e-9
-    semantic_map = {
-        d.metadata["chunk"]: {"doc": d, "score": (1 - s / max_s) * 0.6}
-        for d, s in semantic_hits
-    }
-
-    # BM25 leg
-    bm25_scores = bm25.get_scores(query.lower().split())
-    max_b = bm25_scores.max() + 1e-9
-    bm25_top_idx = np.argsort(bm25_scores)[::-1][:k]
-
-    # Merge with weights: 60% semantic, 40% BM25
-    combined = dict(semantic_map)
-    for idx in bm25_top_idx:
-        if bm25_scores[idx] <= 0:
-            continue
-        doc = all_docs[idx]
-        cid = doc.metadata["chunk"]
-        bm25_contrib = (bm25_scores[idx] / max_b) * 0.4
-        if cid in combined:
-            combined[cid]["score"] += bm25_contrib
-        else:
-            combined[cid] = {"doc": doc, "score": bm25_contrib}
-
-    ranked = sorted(combined.values(), key=lambda x: x["score"], reverse=True)
-    return [item["doc"] for item in ranked[:k]]
-
-
 def rerank(query, docs, reranker, top_k=3):
+    if not docs:
+        return []
     pairs = [(query, d.page_content) for d in docs]
     scores = reranker.predict(pairs)
     ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
     return [doc for _, doc in ranked[:top_k]]
 
+def rerank_with_scores(query, docs, reranker, top_k=3) -> tuple[list, list[float]]:
+    """Like rerank(), but also returns sigmoid-normalized confidence scores (0–1)."""
+    if not docs:
+        return [], []
+    pairs = [(query, d.page_content) for d in docs]
+    raw = reranker.predict(pairs)
+    ranked = sorted(zip(raw, docs), key=lambda x: x[0], reverse=True)[:top_k]
+    scores = [1.0 / (1.0 + math.exp(-float(s))) for s, _ in ranked]
+    top_docs = [d for _, d in ranked]
+    return top_docs, scores
 
-def rewrite_query(query, llm):
-    messages = [
-        SystemMessage(content=(
-            "You are a search query optimizer for document retrieval. "
-            "Rewrite the user's question to be clearer and more specific "
-            "so it retrieves better results from a vector database. "
-            "Return ONLY the rewritten query — no explanation, no quotes."
-        )),
-        HumanMessage(content=query),
-    ]
-    return llm.invoke(messages).content.strip()
+def faithfulness_score(answer: str, context: str) -> tuple[float, str]:
+    """
+    Token-overlap faithfulness: fraction of content words in the answer
+    that appear in the retrieved context. Proxy for answer groundedness.
+    Returns (score 0-1, label: 'high' / 'medium' / 'low').
+    """
+    stop = {
+        "the","a","an","is","are","was","were","be","been","have","has","had",
+        "do","does","did","will","would","could","should","may","might","in",
+        "on","at","to","for","of","and","or","but","not","with","this","that",
+        "it","its","i","you","he","she","they","we","from","by","as","about",
+    }
+    a_tokens = set(re.findall(r"\b\w+\b", answer.lower())) - stop
+    c_tokens = set(re.findall(r"\b\w+\b", context.lower()))
+    if not a_tokens:
+        return 0.0, "low"
+    score = round(len(a_tokens & c_tokens) / len(a_tokens), 3)
+    label = "high" if score >= 0.6 else "medium" if score >= 0.3 else "low"
+    return score, label
 
-# ---------- ANSWER GENERATION ----------
-def generate_answer(question, context, llm):
-    messages = [
-        SystemMessage(content=(
-            "You are a precise document assistant. Answer the user's question "
-            "using ONLY the provided document context. "
-            "If the answer is not in the context, say: "
-            "'I could not find the answer in this document.' "
-            "Cite the page number when possible."
-        )),
-        HumanMessage(content=f"Context:\n{context}\n\nQuestion: {question}"),
+def format_docs(docs) -> str:
+    """Format retrieved docs into a string with page citations."""
+    if not docs:
+        return "No relevant content found."
+    return "\n\n---\n\n".join(
+        f"[Page {d.metadata.get('page', '?')}]\n{d.page_content}"
+        for d in docs
+    )
+
+
+# ---------- AGENT TOOLS ----------
+def make_tools(vectorstore, bm25, all_docs, reranker, llm, full_text):
+    """Create the three LangChain tools for the ReAct agent."""
+
+    def _store_conf(scores: list[float]):
+        if "_conf_scores" not in st.session_state:
+            st.session_state["_conf_scores"] = []
+        st.session_state["_conf_scores"].extend(scores)
+
+    def semantic_search(query: str) -> str:
+        """Search the document using vector embeddings (semantic similarity).
+        Best for conceptual questions and meaning-based retrieval."""
+        hits = vectorstore.similarity_search(query, k=6)
+        top_docs, scores = rerank_with_scores(query, hits, reranker, top_k=3)
+        _store_conf(scores)
+        return format_docs(top_docs)
+
+    def keyword_search(query: str) -> str:
+        """Search the document by exact keywords using BM25.
+        Best for specific terms, names, numbers, dates, or exact phrases."""
+        bm25_scores = bm25.get_scores(query.lower().split())
+        top_idx = np.argsort(bm25_scores)[::-1][:6]
+        candidate_docs = [all_docs[i] for i in top_idx if bm25_scores[i] > 0]
+        if not candidate_docs:
+            return "No keyword matches found."
+        top_docs, scores = rerank_with_scores(query, candidate_docs, reranker, top_k=3)
+        _store_conf(scores)
+        return format_docs(top_docs)
+
+    def summarize_document(_: str) -> str:
+        """Get a high-level summary of the entire document.
+        Use for questions about overall topics, main points, or document structure."""
+        excerpt = full_text[:4000]
+        messages = [
+            SystemMessage(content=(
+                "Summarize the following document excerpt. "
+                "Focus on the main topics, key points, and overall structure. "
+                "Be concise but comprehensive."
+            )),
+            HumanMessage(content=excerpt),
+        ]
+        return llm.invoke(messages).content.strip()
+
+    return [
+        StructuredTool.from_function(
+            func=semantic_search,
+            name="semantic_search",
+            description=(
+                "Search the document semantically using FAISS vector embeddings. "
+                "Best for conceptual questions or when you need passages relevant by meaning. "
+                "Input: a natural language query string."
+            ),
+        ),
+        StructuredTool.from_function(
+            func=keyword_search,
+            name="keyword_search",
+            description=(
+                "Search the document by exact keywords using BM25. "
+                "Best for specific terms, names, numbers, dates, or exact phrases. "
+                "Input: keywords or a short phrase to look up."
+            ),
+        ),
+        StructuredTool.from_function(
+            func=summarize_document,
+            name="summarize_document",
+            description=(
+                "Get a high-level summary of the entire document. "
+                "Use when asked about the overall topic, main points, or document structure. "
+                "Input: any string (ignored — always summarizes the full document)."
+            ),
+        ),
     ]
-    return llm.invoke(messages).content.strip()
+
+
+# ---------- AGENT ----------
+REACT_PROMPT = PromptTemplate.from_template(
+    "You are a precise document Q&A assistant.\n"
+    "Strategy: use semantic_search for conceptual questions, keyword_search for specific "
+    "terms/names/numbers, and summarize_document for overview questions. "
+    "If one tool gives weak results, try another or rephrase. "
+    "Always cite page numbers. "
+    "If no tool finds relevant content, say: 'I could not find the answer in this document.'\n\n"
+    "You have access to the following tools:\n\n"
+    "{tools}\n\n"
+    "Use the following format:\n\n"
+    "Question: the input question you must answer\n"
+    "Thought: you should always think about what to do\n"
+    "Action: the action to take, should be one of [{tool_names}]\n"
+    "Action Input: the input to the action\n"
+    "Observation: the result of the action\n"
+    "... (this Thought/Action/Action Input/Observation can repeat N times)\n"
+    "Thought: I now know the final answer\n"
+    "Final Answer: the final answer to the original input question\n\n"
+    "Begin!\n\n"
+    "Question: {input}\n"
+    "Thought:{agent_scratchpad}"
+)
+
+def build_agent(llm, tools):
+    agent = create_react_agent(llm, tools, REACT_PROMPT)
+    return AgentExecutor(
+        agent=agent,
+        tools=tools,
+        return_intermediate_steps=True,
+        max_iterations=6,
+        handle_parsing_errors=True,
+    )
+
+
+# ---------- SELF-REFLECTION ----------
+def is_weak_answer(answer: str) -> bool:
+    lower = answer.lower()
+    return any(p in lower for p in WEAK_ANSWER_PATTERNS)
+
+def run_with_reflection(question: str, agent, llm):
+    """
+    Run the agent. If it returns a weak answer, have the LLM reflect on why
+    retrieval failed, generate a better query, and re-run once.
+
+    Returns: (final_answer, intermediate_steps, reflected: bool, reflected_query: str | None)
+    AgentExecutor result keys: "output" (str), "intermediate_steps" (list of (AgentAction, str))
+    """
+    result = agent.invoke({"input": question})
+    answer = result["output"]
+    steps = result.get("intermediate_steps", [])
+
+    if not is_weak_answer(answer):
+        return answer, steps, False, None
+
+    # Self-reflection: ask LLM to reformulate the query
+    reflection_msgs = [
+        SystemMessage(content=(
+            "You are a search strategist. A document Q&A agent returned a weak answer. "
+            "Suggest a better, more specific reformulation of the question that might "
+            "retrieve the relevant content. Return ONLY the improved query — no explanation."
+        )),
+        HumanMessage(content=(
+            f"Original question: {question}\n"
+            f"Weak answer: {answer}\n"
+            "Improved search query:"
+        )),
+    ]
+    better_query = llm.invoke(reflection_msgs).content.strip()
+
+    result2 = agent.invoke({"input": better_query})
+    return result2["output"], result2.get("intermediate_steps", []), True, better_query
+
+
+# ---------- TRACE DISPLAY ----------
+def render_agent_trace(steps):
+    """Render AgentExecutor intermediate steps: list of (AgentAction, observation)."""
+    if not steps:
+        st.write("No intermediate steps recorded.")
+        return
+    for i, (action, observation) in enumerate(steps, 1):
+        st.markdown(f"**Step {i} — Tool:** `{action.tool}`")
+        st.code(action.tool_input, language="text")
+        preview = observation[:400] + ("..." if len(observation) > 400 else "")
+        st.markdown("**Observation:**")
+        st.write(preview)
+
 
 # ---------- UI FLOW ----------
 uploaded = st.file_uploader("Choose a **text-based** PDF", type="pdf")
@@ -225,6 +408,8 @@ if uploaded:
         embeddings = get_embeddings()
         vectorstore = FAISS.from_documents(docs, embeddings)
         bm25 = build_bm25(docs)
+    # Log corpus stats (deduplicated by filename in the UI but all runs recorded)
+    get_logger().log_corpus(uploaded.name, len(pages), len(docs))
 
     # Sanity peek
     st.divider()
@@ -237,6 +422,7 @@ if uploaded:
     # Q&A
     st.divider()
     st.subheader("Ask a question about this document")
+    st.caption("Powered by a ReAct agent with semantic search, keyword search, and summarization tools.")
     query = st.text_input("Your question")
 
     if query:
@@ -247,37 +433,77 @@ if uploaded:
         llm = get_llm(groq_api_key)
         reranker = get_reranker()
 
-        # Rewrite query for better retrieval
-        with st.spinner("Optimising query..."):
-            expanded_query = rewrite_query(query, llm)
-        st.caption(f"Expanded query: _{expanded_query}_")
+        # Build tools and agent
+        tools = make_tools(vectorstore, bm25, docs, reranker, llm, full_text)
+        agent = build_agent(llm, tools)
 
-        # Hybrid retrieval: BM25 + semantic search
-        with st.spinner("Searching (hybrid BM25 + semantic)..."):
-            candidate_docs = hybrid_search(expanded_query, vectorstore, bm25, docs, k=8)
+        # Clear any leftover scores from a previous run
+        st.session_state.pop("_conf_scores", None)
 
-        # Rerank candidates
-        with st.spinner("Re-ranking results..."):
-            top_docs = rerank(expanded_query, candidate_docs, reranker, top_k=3)
+        # Run agent with self-reflection (timed)
+        with st.spinner("Agent is reasoning and searching..."):
+            _t0 = time.perf_counter()
+            answer, steps, was_reflected, reflected_query = run_with_reflection(
+                query, agent, llm
+            )
+            latency_ms = round((time.perf_counter() - _t0) * 1000)
 
-        if not top_docs:
-            st.warning("No relevant content found in this document.")
-            st.stop()
+        # Collect confidence scores accumulated during tool calls
+        raw_scores = st.session_state.pop("_conf_scores", [])
+        avg_conf = float(np.mean(raw_scores)) if raw_scores else None
 
-        # Build context with page citations
-        context = "\n\n---\n\n".join(
-            f"[Page {d.metadata.get('page', '?')}]\n{d.page_content}"
-            for d in top_docs
+        # Faithfulness: does the answer come from the retrieved context?
+        retrieved_context = "\n".join(obs for _, obs in steps)
+        faith, faith_label = faithfulness_score(answer, retrieved_context)
+
+        # Log to SQLite
+        tool_calls_log = [
+            {"tool": action.tool, "input": action.tool_input, "observation": obs[:500]}
+            for action, obs in steps
+        ]
+        get_logger().log(
+            question=query,
+            final_answer=answer,
+            was_reflected=was_reflected,
+            reflected_query=reflected_query,
+            tool_calls=tool_calls_log,
+            avg_confidence=avg_conf,
+            faithfulness_score=faith,
+            faithfulness_label=faith_label,
+            latency_ms=latency_ms,
         )
 
-        # Generate answer
-        with st.spinner("Generating answer..."):
-            answer = generate_answer(query, context, llm)
+        # Show reflection notice if triggered
+        if was_reflected:
+            st.info(
+                f"Initial retrieval was weak. Agent self-reflected and re-queried with: "
+                f"_{reflected_query}_"
+            )
 
         st.markdown("### Answer")
         st.write(answer)
 
-        with st.expander("Source chunks used"):
-            for d in top_docs:
-                st.markdown(f"**Page {d.metadata.get('page', '?')}**")
-                st.write(d.page_content)
+        # Metrics row
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if avg_conf is not None:
+                st.metric(
+                    "Retrieval confidence",
+                    f"{avg_conf:.2f}",
+                    help="Avg sigmoid-normalised CrossEncoder score across all tool calls (0–1)",
+                )
+        with col2:
+            st.metric(
+                "Faithfulness",
+                f"{faith:.2f} ({faith_label})",
+                help="Token overlap between answer and retrieved chunks — proxy for groundedness",
+            )
+        with col3:
+            st.metric(
+                "Latency",
+                f"{latency_ms / 1000:.1f}s",
+                help="End-to-end wall-clock time from query submission to answer (includes all LLM + tool calls)",
+            )
+
+        with st.expander("Agent reasoning trace"):
+            render_agent_trace(steps)
