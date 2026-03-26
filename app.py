@@ -14,10 +14,9 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.prompts import PromptTemplate
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
 from langchain_core.tools import StructuredTool
-from langchain.agents import create_react_agent, AgentExecutor
+from langchain.agents import create_agent
 from sentence_transformers import CrossEncoder
 from rank_bm25 import BM25Okapi
 
@@ -60,10 +59,27 @@ groq_api_key = st.sidebar.text_input(
 if not groq_api_key:
     st.sidebar.info("Get a free key at [console.groq.com](https://console.groq.com)")
 
+# ---------- CACHED RESOURCES ----------
+@st.cache_resource(show_spinner=False)
+def get_embeddings():
+    return HuggingFaceEmbeddings(
+        model_name=EMBEDDINGS_MODEL,
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
+
+@st.cache_resource(show_spinner=False)
+def get_reranker():
+    return CrossEncoder(RERANKER_MODEL)
+
+@st.cache_resource(show_spinner=False)
+def get_logger():
+    return QueryLogger()
+
 # ---------- SIDEBAR: Monitoring ----------
 st.sidebar.divider()
 st.sidebar.subheader("Monitoring")
-_stats = get_logger().stats() if True else {}  # always fresh
+_stats = get_logger().stats()
 _corpus = get_logger().corpus_stats()
 if _corpus.get("total_documents"):
     st.sidebar.markdown(
@@ -84,23 +100,6 @@ if _stats.get("total_queries"):
         st.sidebar.markdown(f"**Avg latency:** {_stats['mean_latency_ms'] / 1000:.1f}s")
 else:
     st.sidebar.caption("No queries logged yet.")
-
-# ---------- CACHED RESOURCES ----------
-@st.cache_resource(show_spinner=False)
-def get_embeddings():
-    return HuggingFaceEmbeddings(
-        model_name=EMBEDDINGS_MODEL,
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True},
-    )
-
-@st.cache_resource(show_spinner=False)
-def get_reranker():
-    return CrossEncoder(RERANKER_MODEL)
-
-@st.cache_resource(show_spinner=False)
-def get_logger():
-    return QueryLogger()
 
 def get_llm(api_key: str) -> ChatGroq:
     # tool_choice="auto" lets Groq decide whether to call a tool
@@ -283,38 +282,46 @@ def make_tools(vectorstore, bm25, all_docs, reranker, llm, full_text):
 
 
 # ---------- AGENT ----------
-REACT_PROMPT = PromptTemplate.from_template(
-    "You are a precise document Q&A assistant.\n"
+_AGENT_SYSTEM_PROMPT = (
+    "You are a precise document Q&A assistant. "
     "Strategy: use semantic_search for conceptual questions, keyword_search for specific "
     "terms/names/numbers, and summarize_document for overview questions. "
     "If one tool gives weak results, try another or rephrase. "
     "Always cite page numbers. "
-    "If no tool finds relevant content, say: 'I could not find the answer in this document.'\n\n"
-    "You have access to the following tools:\n\n"
-    "{tools}\n\n"
-    "Use the following format:\n\n"
-    "Question: the input question you must answer\n"
-    "Thought: you should always think about what to do\n"
-    "Action: the action to take, should be one of [{tool_names}]\n"
-    "Action Input: the input to the action\n"
-    "Observation: the result of the action\n"
-    "... (this Thought/Action/Action Input/Observation can repeat N times)\n"
-    "Thought: I now know the final answer\n"
-    "Final Answer: the final answer to the original input question\n\n"
-    "Begin!\n\n"
-    "Question: {input}\n"
-    "Thought:{agent_scratchpad}"
+    "If no tool finds relevant content, say: 'I could not find the answer in this document.'"
 )
 
 def build_agent(llm, tools):
-    agent = create_react_agent(llm, tools, REACT_PROMPT)
-    return AgentExecutor(
-        agent=agent,
-        tools=tools,
-        return_intermediate_steps=True,
-        max_iterations=6,
-        handle_parsing_errors=True,
-    )
+    return create_agent(llm, tools, system_prompt=_AGENT_SYSTEM_PROMPT)
+
+
+# ---------- STEP EXTRACTION ----------
+# create_agent returns a CompiledStateGraph; its output is a message list,
+# not AgentExecutor's {"output", "intermediate_steps"} dict.
+# We reconstruct (action, observation) pairs from the message history so the
+# rest of the code (logging, trace rendering) stays unchanged.
+
+class _Action:
+    """Minimal stand-in for LangChain AgentAction — carries .tool and .tool_input."""
+    __slots__ = ("tool", "tool_input")
+    def __init__(self, tool: str, tool_input: str):
+        self.tool = tool
+        self.tool_input = tool_input
+
+def _extract_steps(messages: list) -> list[tuple]:
+    steps = []
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, AIMessage) or not getattr(msg, "tool_calls", None):
+            continue
+        for tc in msg.tool_calls:
+            obs = next(
+                (m.content for m in messages[i + 1:]
+                 if isinstance(m, ToolMessage) and m.tool_call_id == tc["id"]),
+                "",
+            )
+            inp = tc["args"].get("query") or tc["args"].get("_") or str(tc["args"])
+            steps.append((_Action(tc["name"], inp), obs))
+    return steps
 
 
 # ---------- SELF-REFLECTION ----------
@@ -322,17 +329,13 @@ def is_weak_answer(answer: str) -> bool:
     lower = answer.lower()
     return any(p in lower for p in WEAK_ANSWER_PATTERNS)
 
-def run_with_reflection(question: str, agent, llm):
-    """
-    Run the agent. If it returns a weak answer, have the LLM reflect on why
-    retrieval failed, generate a better query, and re-run once.
+def _run_agent(question: str, agent) -> tuple[str, list]:
+    result = agent.invoke({"messages": [HumanMessage(content=question)]})
+    messages = result["messages"]
+    return messages[-1].content, _extract_steps(messages)
 
-    Returns: (final_answer, intermediate_steps, reflected: bool, reflected_query: str | None)
-    AgentExecutor result keys: "output" (str), "intermediate_steps" (list of (AgentAction, str))
-    """
-    result = agent.invoke({"input": question})
-    answer = result["output"]
-    steps = result.get("intermediate_steps", [])
+def run_with_reflection(question: str, agent, llm):
+    answer, steps = _run_agent(question, agent)
 
     if not is_weak_answer(answer):
         return answer, steps, False, None
@@ -351,9 +354,8 @@ def run_with_reflection(question: str, agent, llm):
         )),
     ]
     better_query = llm.invoke(reflection_msgs).content.strip()
-
-    result2 = agent.invoke({"input": better_query})
-    return result2["output"], result2.get("intermediate_steps", []), True, better_query
+    answer2, steps2 = _run_agent(better_query, agent)
+    return answer2, steps2, True, better_query
 
 
 # ---------- TRACE DISPLAY ----------
